@@ -227,6 +227,21 @@
   .only-tag{ font-family: var(--mono); font-size:10px; padding:1px 7px; border-radius:5px; background: var(--panel-2); color: var(--muted); margin-top:3px; display:inline-block;}
 
   footer{ text-align:center; color: var(--muted); font-size:11.5px; padding: 30px 10px 40px; }
+
+  @media print {
+    * { -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
+    body { background: var(--bg); }
+    .topbar-actions, .upload-grid, .intro { display: none !important; }
+    .toolbar { position: static !important; }
+    .toolbar input[type=text], #filterSeg, .chk-label, #legendDiff, .accordion-toolbar button { display: none !important; }
+    thead th { position: static !important; }
+    .tbl-wrap { max-height: none !important; overflow: visible !important; }
+    .step-body { overflow: visible !important; }
+    .step-group { break-inside: avoid-page; }
+    .topbar { position: static !important; }
+    .wrap { max-width: none; }
+  }
+
 </style>
 </head>
 <body>
@@ -241,6 +256,7 @@
   </div>
   <div class="topbar-actions">
     <button class="btn" id="exportCsvBtn" style="display:none;">Export CSV</button>
+    <button class="btn" id="exportPdfBtn" style="display:none;">Export PDF</button>
     <button class="btn" id="resetBtn" style="display:none;">Reset</button>
   </div>
 </div>
@@ -706,6 +722,7 @@ document.querySelectorAll('#filterSeg button').forEach(btn => {
 });
 document.getElementById('resetBtn').addEventListener('click', () => location.reload());
 document.getElementById('exportCsvBtn').addEventListener('click', exportCsv);
+document.getElementById('exportPdfBtn').addEventListener('click', exportPdf);
 
 /* ============================= RENDER ============================= */
 function render() {
@@ -714,6 +731,7 @@ function render() {
   document.getElementById('results').style.display = has ? 'block' : 'none';
   document.getElementById('emptyState').style.display = has ? 'none' : 'block';
   document.getElementById('exportCsvBtn').style.display = has ? 'inline-block' : 'none';
+  document.getElementById('exportPdfBtn').style.display = has ? 'inline-block' : 'none';
   document.getElementById('resetBtn').style.display = has ? 'inline-block' : 'none';
   document.getElementById('diffOnlyWrap').style.display = systems.length > 1 ? 'flex' : 'none';
   document.getElementById('legendDiff').style.display = systems.length > 1 ? 'flex' : 'none';
@@ -869,9 +887,14 @@ function renderTable() {
   }
 }
 
-function renderSingleTable(sys, area, stat) {
+function getFilteredSinglePhases(sys) {
   let phases = collapseAttempts(sys.phases);
   phases = phases.filter(p => phaseMatchesFilter(p) && phaseMatchesSearch(p));
+  return phases;
+}
+
+function renderSingleTable(sys, area, stat) {
+  const phases = getFilteredSinglePhases(sys);
 
   stat.textContent = `${phases.length} of ${sys.phases.length} phase-entries shown`;
 
@@ -973,12 +996,11 @@ function collapseAttemptsForCompare(phases) {
   return byName;
 }
 
-function renderCompareTable(systems, area, stat) {
+function getFilteredComparePhaseInfo(systems) {
   const perSys = systems.map(s => collapseAttemptsForCompare(s.phases));
   const order = [];
   perSys.forEach(m => { Object.keys(m).forEach(n => { if (!order.includes(n)) order.push(n); }); });
 
-  // Precompute diff flags per phase across systems
   const phaseInfo = order.map(name => {
     const cells = perSys.map(m => m[name] || null);
     const sigs = cells.map(selectedSignature);
@@ -995,6 +1017,12 @@ function renderCompareTable(systems, area, stat) {
 
   let filtered = phaseInfo.filter(pi => pi.anyMatchFilter && pi.searchOk);
   if (state.diffOnly) filtered = filtered.filter(pi => pi.rowDiff);
+
+  return { perSys, order, phaseInfo, filtered };
+}
+
+function renderCompareTable(systems, area, stat) {
+  const { order, phaseInfo, filtered } = getFilteredComparePhaseInfo(systems);
 
   stat.textContent = `${filtered.length} of ${order.length} phases shown &middot; comparing ${systems.length} systems &middot; ${phaseInfo.filter(p=>p.rowDiff).length} phases differ`;
 
@@ -1131,23 +1159,17 @@ function exportCsv() {
   const systems = loadedSystems();
   const rows = [];
   if (systems.length > 1) {
-    const perSys = systems.map(s => collapseAttemptsForCompare(s.phases));
-    const order = [];
-    perSys.forEach(m => { Object.keys(m).forEach(n => { if (!order.includes(n)) order.push(n); }); });
-    const header = ['Phase'];
+    const { filtered } = getFilteredComparePhaseInfo(systems);
+    const header = ['Roadmap Step', 'Phase'];
     systems.forEach(s => {
       const nm = s.label;
       header.push(nm+'_Time', nm+'_Prompt', nm+'_Selected', nm+'_LogFiles', nm+'_Error');
     });
     header.push('Differs');
     rows.push(header);
-    order.forEach(name => {
-      const cells = perSys.map(m => m[name] || null);
-      const sigs = cells.map(selectedSignature);
-      const flags = diffFlags(sigs);
-      const rowDiff = flags.some(f=>f);
-      const row = [name];
-      cells.forEach(c => {
+    filtered.forEach(pi => {
+      const row = [pi.roadmapStep, pi.name];
+      pi.cells.forEach(c => {
         row.push(
           c ? c.startTime+' - '+c.endTime : '',
           c ? (c.prompts||[]).map(p=>p.title).join(' | ') : '',
@@ -1156,15 +1178,16 @@ function exportCsv() {
           c ? (c.errors||[]).filter(e=>e.type!=='headline').map(e=>e.text).join(' | ') : ''
         );
       });
-      row.push(rowDiff ? 'YES' : 'no');
+      row.push(pi.rowDiff ? 'YES' : 'no');
       rows.push(row);
     });
   } else {
     const sys = systems[0];
-    rows.push(['Phase','Start','End','Duration','Prompt','OptionsAvailable','OptionSelected','LogFiles','ErrorDetails']);
-    collapseAttempts(sys.phases).forEach(p => {
+    const phases = getFilteredSinglePhases(sys);
+    rows.push(['Roadmap Step','Phase','Start','End','Duration','Prompt','OptionsAvailable','OptionSelected','LogFiles','ErrorDetails']);
+    phases.forEach(p => {
       rows.push([
-        p.name, p.startTime, p.endTime, fmtDur(p.startTime,p.endTime),
+        p.roadmapStep, p.name, p.startTime, p.endTime, fmtDur(p.startTime,p.endTime),
         (p.prompts||[]).map(x=>x.title).join(' | '),
         (p.prompts||[]).map(x=>(x.options||[]).map(o=>o.text).join(', ')).join(' | '),
         (p.prompts||[]).map(x=>x.selected).join(' | '),
@@ -1180,6 +1203,16 @@ function exportCsv() {
   a.href = url; a.download = 'sum_log_analysis.csv'; a.click();
   URL.revokeObjectURL(url);
 }
+
+/* ============================= PDF EXPORT (print-to-PDF, matches on-screen view) ============================= */
+function exportPdf() {
+  const systems = loadedSystems();
+  const parts = ['SUM_Log_Analysis'];
+  systems.forEach(s => parts.push(String(s.label).replace(/[^A-Za-z0-9_-]+/g, '_')));
+  document.title = parts.join('_');
+  window.print();
+}
+
 </script>
 </body>
 </html>
