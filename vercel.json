@@ -1,0 +1,6 @@
+{
+  "cleanUrls": true,
+  "rewrites": [
+    { "source": "/", "destination": "/SAP%20SUM%20Tool%20Log%20Analyzer.html" }
+  ]
+}
