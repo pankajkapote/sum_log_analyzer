@@ -194,6 +194,25 @@
   .badge.na{ background: rgba(139,149,165,.12); color: var(--muted); }
   .badge.retry{ background: rgba(240,166,58,.15); color: var(--warn); margin-left:5px; }
   .opt-list{ margin:0; padding-left:16px; font-size:12px; color: var(--muted); }
+  .prompt-fields{ background: rgba(62,207,142,0.06); border:1px solid rgba(62,207,142,0.25); border-radius:6px; padding:6px 9px; margin:4px 0 6px 0; }
+  .prompt-diag{ background: rgba(240,166,58,0.05); border:1px solid rgba(240,166,58,0.2); border-radius:6px; padding:6px 9px; margin:4px 0 6px 0; }
+  .prompt-diag .pd-lbl{ font-size:9.5px; color: var(--warn); text-transform:uppercase; letter-spacing:.6px; font-family:var(--mono); margin-bottom:3px; }
+  .prompt-diag .pd-row{ font-size:11.5px; line-height:1.5; }
+  .prompt-diag .pd-key{ color: var(--muted); font-family: var(--mono); }
+  .prompt-diag .pd-val{ color: var(--text); }
+  .prompt-fields .pf-lbl{ font-size:9.5px; color: var(--ok); text-transform:uppercase; letter-spacing:.6px; font-family:var(--mono); margin-bottom:3px; }
+  .prompt-fields .pf-row{ font-size:12px; line-height:1.5; }
+  .prompt-fields .pf-key{ color: var(--muted); font-family: var(--mono); }
+  .prompt-fields .pf-val{ color: var(--ok); font-weight:600; }
+  .prompt-fields .pf-val.pf-empty{ color: var(--muted); font-weight:400; font-style:italic; }
+  .prompt-fulltext{ margin-top:5px; }
+  .prompt-fulltext summary{ cursor:pointer; font-size:11px; color: var(--accent); font-family:var(--mono); }
+  .prompt-fulltext summary:hover{ text-decoration: underline; }
+  .prompt-fulltext pre{
+    white-space: pre-wrap; word-break: break-word; font-family: var(--sans); font-size:11.5px;
+    color: var(--text); background: var(--panel-2); border:1px solid var(--line); border-radius:6px;
+    padding:8px 10px; margin-top:5px; max-width: 480px; line-height:1.5;
+  }
   .opt-list li.sel{ color: var(--ok); font-weight:600; }
   .opt-list li.sel::marker{ color: var(--ok); }
   .selected-val{ color: var(--ok); font-weight:600; }
@@ -370,11 +389,38 @@ function parseLog(text) {
   const sectionTitleRe = /^={3,}\s*(.+?)\s*={3,}$/;
   const optionRe = /^\d{2}\)\s+([X*\-])\s+(.+)$/;
   const selectionRe = /^([A-Za-z][A-Za-z0-9 _'"\/]{1,50}?):\s*(\S.+)$/;
+  const fieldLineRe = /^([A-Za-z][A-Za-z0-9 _'"\/\.]{1,50}):\s*(.*)$/;
   const logFileRe = /'([A-Za-z0-9_\-]+\.(?:LOG|ELG))'/gi;
+
+  function extractFields(bodyLines) {
+    const fields = [];
+    const diagnosticFields = [];
+    bodyLines.forEach(l => {
+      const t = l.trim();
+      if (!t) return;
+      const m = t.match(fieldLineRe);
+      if (!m) return;
+      const lbl = m[1].trim();
+      const val = m[2].trim();
+      // Reject "...sql script D:\usr\sap\..." style false positives, where a
+      // sentence happens to end in a single drive letter right before the
+      // colon of a Windows path - that's not a real Label: value field.
+      const looksLikeDriveLetter = /(^|["'\s])[A-Za-z]$/.test(lbl) && /^\\/.test(val);
+      if (looksLikeDriveLetter) return;
+      // Lines like A3EEMFLE_TOOLS 129 Table "MBEWH": status not set to
+      // converted are SUM-generated diagnostic listings, not something a
+      // person typed - keep them separate from genuine user input.
+      const looksDiagnostic = /["]/.test(lbl) || /^[A-Z][A-Z0-9_]{2,}\s+\d+\b/.test(lbl);
+      if (looksDiagnostic) diagnosticFields.push({ label: lbl, value: val });
+      else fields.push({ label: lbl, value: val });
+    });
+    return { fields, diagnosticFields };
+  }
 
   phases.forEach(p => {
     const cl = p.chunkLines;
     let lastSectionTitle = null;
+    let promptBodyLines = [];
     const prompts = [];
     const errors = [];
 
@@ -382,10 +428,11 @@ function parseLog(text) {
       const line = cl[i];
 
       const sTitle = line.match(sectionTitleRe);
-      if (sTitle && !/^=+$/.test(sTitle[1])) { lastSectionTitle = sTitle[1]; continue; }
+      if (sTitle && !/^=+$/.test(sTitle[1])) { lastSectionTitle = sTitle[1]; promptBodyLines = []; continue; }
 
       if (/^Severe error\(s\) occurred in phase/.test(line.trim()) || /^Checks after phase .* were negative/.test(line.trim())) {
         errors.push({ type: 'headline', text: line.trim() });
+        continue;
       }
       if (/^Last generated error message:/.test(line.trim())) {
         let j = i + 1;
@@ -393,6 +440,8 @@ function parseLog(text) {
         const msgLines = [];
         while (j < cl.length && cl[j].trim() !== '') { msgLines.push(cl[j].trim()); j++; }
         if (msgLines.length) errors.push({ type: 'message', text: msgLines.join(' ') });
+        i = j - 1;
+        continue;
       }
       if (/^The following errors were detected in the log files:/.test(line.trim())) {
         const snippet = [];
@@ -405,6 +454,8 @@ function parseLog(text) {
           j++;
         }
         if (snippet.length) errors.push({ type: 'details', text: snippet.join(' | ') });
+        i = j - 1;
+        continue;
       }
 
       if (optionRe.test(line)) {
@@ -415,20 +466,34 @@ function parseLog(text) {
           if (om) options.push({ marker: om[1], text: om[2].trim() });
           j++;
         }
-        let sel = null, selLabel = null;
+        let sel = null, selLabel = null, selConsumedAt = null;
         let k2 = j;
         while (k2 < cl.length && cl[k2].trim() === '') k2++;
         if (k2 < cl.length) {
           const selm = cl[k2].match(selectionRe);
-          if (selm) { selLabel = selm[1].trim(); sel = selm[2].trim(); }
+          if (selm) { selLabel = selm[1].trim(); sel = selm[2].trim(); selConsumedAt = k2; }
         }
         if (sel) sel = sel.replace(/^:\s*/, '');
         if (!sel) {
           const checked = options.filter(o => o.marker === 'X');
           if (checked.length) { sel = checked.map(o => o.text).join('; '); selLabel = 'Checkbox (pre-selected)'; }
         }
-        prompts.push({ title: lastSectionTitle, options, selectionLabel: selLabel, selected: sel });
-        i = j - 1;
+        const { fields, diagnosticFields } = extractFields(promptBodyLines);
+        const bodyText = promptBodyLines.map(l => l.trim()).filter((t,idx,arr) => !(t==='' && (idx===0 || arr[idx-1]==='')) ).join('\n').trim().slice(0, 3000);
+        prompts.push({ title: lastSectionTitle, options, selectionLabel: selLabel, selected: sel, fields, diagnosticFields, bodyText });
+        promptBodyLines = [];
+        i = (selConsumedAt != null) ? selConsumedAt : j - 1;
+        continue;
+      }
+
+      // Free text between a section title and its options block (or general
+      // narrative text) - scanned for inline "Label: value" user-entered
+      // fields (e.g. "SPDD Transport: S4XK900049") and kept verbatim so the
+      // full prompt text can be shown on demand even when nothing matches.
+      if (line.trim() !== '' && !/^={3,}$/.test(line.trim())) {
+        promptBodyLines.push(line);
+      } else if (line.trim() === '') {
+        promptBodyLines.push('');
       }
     }
 
@@ -647,7 +712,7 @@ function renderUploadSlots() {
   let html = '';
   state.slots.forEach((slot, idx) => {
     const loaded = !!slot.parsed;
-    const tagLabel = slotPlaceholder(idx);
+    const tagLabel = 'System ' + (idx + 1);
     const detectedSid = loaded ? sysLabel(slot, idx) : null;
     html += `<div class="dropzone ${loaded?'loaded':''}" data-slot="${idx}" id="dz-${idx}">
       ${state.slots.length > 1 ? `<span class="remove-slot" data-remove="${idx}" title="Remove this system">&times;</span>` : ''}
@@ -817,7 +882,7 @@ function phaseMatchesFilter(p) {
   return true;
 }
 function phaseSearchHay(p) {
-  return [p.name, ...(p.prompts||[]).map(pr=>(pr.title||'')+' '+(pr.selected||'')+' '+(pr.options||[]).map(o=>o.text).join(' ')), ...(p.errors||[]).map(e=>e.text), (p.logFiles||[]).join(' ')].join(' ').toLowerCase();
+  return [p.name, ...(p.prompts||[]).map(pr=>(pr.title||'')+' '+(pr.selected||'')+' '+(pr.options||[]).map(o=>o.text).join(' ')+' '+(pr.fields||[]).map(f=>f.label+' '+f.value).join(' ')+' '+(pr.diagnosticFields||[]).map(f=>f.label+' '+f.value).join(' ')+' '+(pr.bodyText||'')), ...(p.errors||[]).map(e=>e.text), (p.logFiles||[]).join(' ')].join(' ').toLowerCase();
 }
 function phaseMatchesSearch(p) {
   if (!state.search) return true;
@@ -849,7 +914,16 @@ function promptListHtml(prompts) {
   if (!prompts || !prompts.length) return '<span class="muted">—</span>';
   return prompts.map(pr => {
     const opts = (pr.options||[]).map(o => `<li class="${o.text===pr.selected?'sel':''}">${esc(o.text)}</li>`).join('');
-    return `<div class="prompt-title">${esc(pr.title||'Prompt')}</div><ul class="opt-list">${opts}</ul>`;
+    const fieldsHtml = (pr.fields && pr.fields.length)
+      ? `<div class="prompt-fields"><div class="pf-lbl">User Input</div>${pr.fields.map(f => `<div class="pf-row"><span class="pf-key">${esc(f.label)}:</span> <span class="pf-val ${f.value?'':'pf-empty'}">${f.value?esc(f.value):'(left blank)'}</span></div>`).join('')}</div>`
+      : '';
+    const diagHtml = (pr.diagnosticFields && pr.diagnosticFields.length)
+      ? `<div class="prompt-diag"><div class="pd-lbl">Diagnostic Detail</div>${pr.diagnosticFields.map(f => `<div class="pd-row"><span class="pd-key">${esc(f.label)}:</span> <span class="pd-val">${f.value?esc(f.value):'(no detail)'}</span></div>`).join('')}</div>`
+      : '';
+    const fullTextHtml = pr.bodyText
+      ? `<details class="prompt-fulltext"><summary>Show full prompt text</summary><pre>${esc(pr.bodyText)}</pre></details>`
+      : '';
+    return `<div class="prompt-title">${esc(pr.title||'Prompt')}</div>${fieldsHtml}${diagHtml}<ul class="opt-list">${opts}</ul>${fullTextHtml}`;
   }).join('<div style="height:8px"></div>');
 }
 function selectedHtml(prompts) {
@@ -871,8 +945,9 @@ function logFilesHtml(p) {
 function selectedSignature(p) {
   if (!p) return null;
   const sel = (p.prompts||[]).map(x=>x.selected).filter(Boolean).join(' | ');
+  const fields = (p.prompts||[]).map(x=>(x.fields||[]).map(f=>f.label+'='+f.value).join(';')).filter(Boolean).join(' | ');
   const logs = (p.logFiles||[]).slice().sort().join(',');
-  return JSON.stringify({ sel, err: !!p.hasError, logs });
+  return JSON.stringify({ sel, fields, err: !!p.hasError, logs });
 }
 
 function renderTable() {
@@ -1163,7 +1238,7 @@ function exportCsv() {
     const header = ['Roadmap Step', 'Phase'];
     systems.forEach(s => {
       const nm = s.label;
-      header.push(nm+'_Time', nm+'_Prompt', nm+'_Selected', nm+'_LogFiles', nm+'_Error');
+      header.push(nm+'_Time', nm+'_Prompt', nm+'_Selected', nm+'_UserInput', nm+'_DiagnosticDetails', nm+'_LogFiles', nm+'_Error');
     });
     header.push('Differs');
     rows.push(header);
@@ -1174,6 +1249,8 @@ function exportCsv() {
           c ? c.startTime+' - '+c.endTime : '',
           c ? (c.prompts||[]).map(p=>p.title).join(' | ') : '',
           c ? (c.prompts||[]).map(p=>p.selected).join(' | ') : '',
+          c ? (c.prompts||[]).map(p=>(p.fields||[]).map(f=>f.label+': '+(f.value||'(blank)')).join(', ')).filter(Boolean).join(' | ') : '',
+          c ? (c.prompts||[]).map(p=>(p.diagnosticFields||[]).map(f=>f.label+': '+(f.value||'')).join(', ')).filter(Boolean).join(' | ') : '',
           c ? (c.logFiles||[]).join(' ') : '',
           c ? (c.errors||[]).filter(e=>e.type!=='headline').map(e=>e.text).join(' | ') : ''
         );
@@ -1184,13 +1261,15 @@ function exportCsv() {
   } else {
     const sys = systems[0];
     const phases = getFilteredSinglePhases(sys);
-    rows.push(['Roadmap Step','Phase','Start','End','Duration','Prompt','OptionsAvailable','OptionSelected','LogFiles','ErrorDetails']);
+    rows.push(['Roadmap Step','Phase','Start','End','Duration','Prompt','OptionsAvailable','OptionSelected','UserInput','DiagnosticDetails','LogFiles','ErrorDetails']);
     phases.forEach(p => {
       rows.push([
         p.roadmapStep, p.name, p.startTime, p.endTime, fmtDur(p.startTime,p.endTime),
         (p.prompts||[]).map(x=>x.title).join(' | '),
         (p.prompts||[]).map(x=>(x.options||[]).map(o=>o.text).join(', ')).join(' | '),
         (p.prompts||[]).map(x=>x.selected).join(' | '),
+        (p.prompts||[]).map(x=>(x.fields||[]).map(f=>f.label+': '+(f.value||'(blank)')).join(', ')).filter(Boolean).join(' | '),
+        (p.prompts||[]).map(x=>(x.diagnosticFields||[]).map(f=>f.label+': '+(f.value||'')).join(', ')).filter(Boolean).join(' | '),
         (p.logFiles||[]).join(' '),
         (p.errors||[]).filter(e=>e.type!=='headline').map(e=>e.text).join(' | '),
       ]);
