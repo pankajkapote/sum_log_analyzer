@@ -45,6 +45,7 @@
   }
   .brand-text h1{ font-size:15px; margin:0; letter-spacing:.2px; font-weight:600;}
   .brand-text span{ font-size:11.5px; color: var(--muted); font-family: var(--mono); }
+  .brand-text span.tagline{ font-style: italic; }
   .topbar-actions{ display:flex; gap:10px; align-items:center; }
   .btn{
     background: var(--panel-2); color: var(--text); border:1px solid var(--line);
@@ -82,6 +83,16 @@
     cursor:pointer; line-height:1;
   }
   .dropzone .remove-slot:hover{ color: var(--err); }
+  .upgana-slot{
+    margin-top:10px; padding-top:9px; border-top:1px dashed var(--line);
+    width:100%; text-align:center; cursor:pointer;
+  }
+  .upgana-slot:hover .upgana-hint{ color: var(--accent); text-decoration: underline; }
+  .upgana-slot .upgana-hint{ font-size:11px; color: var(--muted); }
+  .upgana-slot .upgana-loaded{ font-size:11px; color: var(--ok); font-family: var(--mono); }
+  .upgana-slot.drag{ background: rgba(79,195,217,0.08); border-radius:6px; }
+  .upgana-slot input{ display:none; }
+
   .add-slot-card{
     border: 1.5px dashed var(--line); border-radius:12px; padding:24px 18px;
     display:flex; flex-direction:column; align-items:center; justify-content:center; gap:6px;
@@ -162,6 +173,9 @@
   .metric-chip.actual .m-val{ color: var(--ok); }
   .metric-chip.wait .m-val{ color: var(--warn); }
   .metric-chip.diffcell{ background: var(--diff-bg); box-shadow: inset 3px 0 0 var(--diff-border); }
+  .src-tag{ display:inline-block; font-family: var(--mono); font-size:9.5px; letter-spacing:.4px; padding:3px 8px; border-radius:5px; margin-left:4px; align-self:center; cursor:help; }
+  .src-tag.src-upgana{ background: rgba(62,207,142,.14); color: var(--ok); }
+  .src-tag.src-mixed{ background: rgba(240,166,58,.14); color: var(--warn); }
   .step-body{ display:none; border-top:1px solid var(--line); }
   .step-group.open .step-body{ display:block; }
   .step-status-note{ padding:8px 16px; font-size:11.5px; color: var(--muted); border-top:1px solid var(--line); font-style:italic; }
@@ -270,7 +284,8 @@
     <div class="brand-mark">SUM</div>
     <div class="brand-text">
       <h1>SUM Console Log Analyzer</h1>
-      <span>SAPupConsole.log &rarr; phase / prompt / error breakdown</span>
+      <span>SAPupConsole.log &rarr; phase / prompt / error breakdown</span><br>
+      <span class="tagline">Built by a BASIS guy, for BASIS guys &mdash; Pankaj Kapote</span>
     </div>
   </div>
   <div class="topbar-actions">
@@ -318,7 +333,7 @@
 
 </div>
 
-<footer>Parsing happens entirely in your browser. Nothing is sent to a server.<br><span style="opacity:.75;">Built by a BASIS guy, for BASIS guys &mdash; Pankaj Kapote</span></footer>
+<footer>Parsing happens entirely in your browser. Nothing is sent to a server.</footer>
 
 <script>
 /* ============================= PARSER ============================= */
@@ -328,6 +343,72 @@ function parseTs(s) {
   const [y, mo, da] = d.split('/').map(Number);
   const [h, mi, se] = t.split(':').map(Number);
   return new Date(y, mo - 1, da, h, mi, se).getTime();
+}
+
+/* ============================= UPGANA.HTML PARSER (optional, gives authoritative per-phase runtime) ============================= */
+function parseUpgana(text) {
+  const map = {};
+  const rowRe = /<div class="p([ab])p tableCell[^"]*">([^<]*)<\/div>\s*<div class="p\1 tableCell">([^<]*)<\/div>\s*<div class="p\1 tableCell">([^<]*)<\/div>\s*<div class="p\1 tableCell">([^<]*)<\/div>/g;
+  let m;
+  while ((m = rowRe.exec(text)) !== null) {
+    const name = m[2].trim();
+    const timeStr = m[3].trim();
+    const runs = m[4].trim();
+    const failed = m[5].trim();
+    if (!name) continue;
+    const hasDialogs = /\+\s*dialogs/i.test(timeStr);
+    const timePart = timeStr.replace(/\+\s*dialogs/i, '').trim();
+    const pieces = timePart.split(':').map(Number);
+    let h = 0, mi = 0, s = 0;
+    if (pieces.length === 3) { [h, mi, s] = pieces; }
+    else if (pieces.length === 2) { [mi, s] = pieces; }
+    else if (pieces.length === 1) { s = pieces[0]; }
+    if ([h, mi, s].some(isNaN)) continue;
+    const ms = ((h * 3600) + (mi * 60) + s) * 1000;
+    map[name] = { runtimeMs: ms, hasDialogs, runs: Number(runs) || 1, failed: Number(failed) || 0 };
+  }
+  return map;
+}
+
+// Corrects the "actual runtime" of each roadmap step using SAP's own UPGANA.html
+// report, which measures true active processing time per phase and excludes
+// time spent sitting at a manual prompt ("+ dialogs"). Without this, a phase
+// that was left open for hours/days waiting on a decision gets its ENTIRE span
+// misclassified as active runtime, since the console log only has start/end
+// timestamps for the phase as a whole, not a breakdown of active-vs-waiting.
+function applyUpganaCorrection(phases, roadmapSteps, upganaMap) {
+  if (!upganaMap) return { phases, roadmapSteps };
+  const phasesOut = phases.map(p => {
+    const baseName = p.name.split('/').pop();
+    const u = upganaMap[baseName];
+    return u ? { ...p, upganaRuntimeMs: u.runtimeMs, upganaHasDialogs: u.hasDialogs } : { ...p, upganaRuntimeMs: null };
+  });
+  const stepsOut = roadmapSteps.map(st => {
+    const stepPhases = phasesOut.filter(p => p.roadmapStep === st.name);
+    const byBase = {};
+    stepPhases.forEach(p => {
+      const base = p.name.split('/').pop();
+      (byBase[base] = byBase[base] || []).push(p);
+    });
+    let actualRuntimeMs = 0;
+    let anyUpgana = false, anyEstimated = false;
+    Object.values(byBase).forEach(group => {
+      if (group[0].upganaRuntimeMs != null) {
+        actualRuntimeMs += group[0].upganaRuntimeMs;
+        anyUpgana = true;
+      } else {
+        group.forEach(p => {
+          const s = parseTs(p.startTime), e = parseTs(p.endTime);
+          if (s != null && e != null && e >= s) actualRuntimeMs += (e - s);
+        });
+        anyEstimated = true;
+      }
+    });
+    const waitTimeMs = (st.elapsedMs != null) ? Math.max(0, st.elapsedMs - actualRuntimeMs) : null;
+    const runtimeSource = anyUpgana && anyEstimated ? 'mixed' : anyUpgana ? 'upgana' : 'estimated';
+    return { ...st, actualRuntimeMs, waitTimeMs, runtimeSource };
+  });
+  return { phases: phasesOut, roadmapSteps: stepsOut };
 }
 
 function parseLog(text) {
@@ -649,7 +730,7 @@ function parseLog(text) {
 /* ============================= STATE ============================= */
 const MAX_SLOTS = 8;
 const state = {
-  slots: [ { file: null, name: null, parsed: null }, { file: null, name: null, parsed: null } ],
+  slots: [ { file: null, name: null, parsed: null, upganaMap: null, upganaName: null }, { file: null, name: null, parsed: null, upganaMap: null, upganaName: null } ],
   filter: 'notable',
   search: '',
   collapse: true,
@@ -674,12 +755,16 @@ function loadedSystems() {
   const result = state.slots
     .map((s, idx) => ({ idx, s }))
     .filter(x => x.s.parsed)
-    .map(x => ({
-      label: sysLabel(x.s, x.idx),
-      header: x.s.parsed.header,
-      phases: x.s.parsed.phases,
-      roadmapSteps: x.s.parsed.roadmapSteps,
-    }));
+    .map(x => {
+      const { phases, roadmapSteps } = applyUpganaCorrection(x.s.parsed.phases, x.s.parsed.roadmapSteps, x.s.upganaMap || null);
+      return {
+        label: sysLabel(x.s, x.idx),
+        header: x.s.parsed.header,
+        phases,
+        roadmapSteps,
+        hasUpgana: !!x.s.upganaMap,
+      };
+    });
   state._systemsCache = result;
   return result;
 }
@@ -704,6 +789,12 @@ function fmtMs(ms) {
   return days + 'd ' + (totalHr % 24) + 'h ' + (totalMin % 60) + 'm';
 }
 
+function sourceTagHtml(m) {
+  if (!m || !m.runtimeSource || m.runtimeSource === 'estimated') return '';
+  if (m.runtimeSource === 'upgana') return '<span class="src-tag src-upgana" title="Actual Runtime for every phase in this step came from the uploaded UPGANA.html">SAP UPGANA</span>';
+  return '<span class="src-tag src-mixed" title="Some phases in this step used UPGANA.html data, others fell back to the estimated start-to-end span">UPGANA (partial)</span>';
+}
+
 function esc(str){ if (str==null) return ''; return String(str).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
 /* ============================= UPLOAD SLOTS UI ============================= */
@@ -714,6 +805,7 @@ function renderUploadSlots() {
     const loaded = !!slot.parsed;
     const tagLabel = 'System ' + (idx + 1);
     const detectedSid = loaded ? sysLabel(slot, idx) : null;
+    const upganaLoaded = !!slot.upganaMap;
     html += `<div class="dropzone ${loaded?'loaded':''}" data-slot="${idx}" id="dz-${idx}">
       ${state.slots.length > 1 ? `<span class="remove-slot" data-remove="${idx}" title="Remove this system">&times;</span>` : ''}
       <div class="tag">${tagLabel}${idx>1?' &middot; optional':(idx===1?' &middot; optional':'')}</div>
@@ -721,6 +813,12 @@ function renderUploadSlots() {
       <div class="hint" style="${loaded?'display:none;':''}">Drop SAPupConsole.log here, or click to browse</div>
       <div class="fname">${loaded?('Target system: <strong>'+esc(detectedSid)+'</strong>'):''}</div>
       <input type="file" accept=".txt,.log" data-input="${idx}">
+      ${loaded ? `
+      <div class="upgana-slot" data-upgana-zone="${idx}">
+        <div class="upgana-hint" style="${upganaLoaded?'display:none;':''}">+ Add UPGANA.html for precise runtime (optional)</div>
+        <div class="upgana-loaded" style="${upganaLoaded?'':'display:none;'}">&#10003; UPGANA.html loaded &mdash; runtime corrected</div>
+        <input type="file" accept=".html,.htm" data-upgana-input="${idx}">
+      </div>` : ''}
     </div>`;
   });
   if (state.slots.length < MAX_SLOTS) {
@@ -732,7 +830,7 @@ function renderUploadSlots() {
     const zone = document.getElementById('dz-' + idx);
     const input = zone.querySelector(`input[data-input="${idx}"]`);
     zone.addEventListener('click', (e) => {
-      if (e.target.classList.contains('remove-slot')) return;
+      if (e.target.classList.contains('remove-slot') || e.target.closest('[data-upgana-zone]')) return;
       input.click();
     });
     zone.addEventListener('dragover', (e) => { e.preventDefault(); zone.classList.add('drag'); });
@@ -744,11 +842,24 @@ function renderUploadSlots() {
     input.addEventListener('change', (e) => { if (e.target.files.length) loadFileIntoSlot(idx, e.target.files[0]); });
     const removeBtn = zone.querySelector('.remove-slot');
     if (removeBtn) removeBtn.addEventListener('click', (e) => { e.stopPropagation(); removeSlot(idx); });
+
+    const upganaZone = zone.querySelector(`[data-upgana-zone="${idx}"]`);
+    if (upganaZone) {
+      const upganaInput = upganaZone.querySelector(`input[data-upgana-input="${idx}"]`);
+      upganaZone.addEventListener('click', (e) => { e.stopPropagation(); upganaInput.click(); });
+      upganaZone.addEventListener('dragover', (e) => { e.preventDefault(); e.stopPropagation(); upganaZone.classList.add('drag'); });
+      upganaZone.addEventListener('dragleave', (e) => { e.stopPropagation(); upganaZone.classList.remove('drag'); });
+      upganaZone.addEventListener('drop', (e) => {
+        e.preventDefault(); e.stopPropagation(); upganaZone.classList.remove('drag');
+        if (e.dataTransfer.files.length) loadUpganaIntoSlot(idx, e.dataTransfer.files[0]);
+      });
+      upganaInput.addEventListener('change', (e) => { if (e.target.files.length) loadUpganaIntoSlot(idx, e.target.files[0]); });
+    }
   });
 
   const addCard = document.getElementById('addSlotCard');
   if (addCard) addCard.addEventListener('click', () => {
-    state.slots.push({ file: null, name: null, parsed: null });
+    state.slots.push({ file: null, name: null, parsed: null, upganaMap: null, upganaName: null });
     renderUploadSlots();
   });
 }
@@ -766,9 +877,21 @@ function loadFileIntoSlot(idx, file) {
   reader.readAsText(file);
 }
 
+function loadUpganaIntoSlot(idx, file) {
+  const reader = new FileReader();
+  reader.onload = (ev) => {
+    state.slots[idx].upganaName = file.name;
+    state.slots[idx].upganaMap = parseUpgana(ev.target.result);
+    invalidateSystemsCache();
+    renderUploadSlots();
+    render();
+  };
+  reader.readAsText(file);
+}
+
 function removeSlot(idx) {
   state.slots.splice(idx, 1);
-  if (state.slots.length === 0) state.slots.push({ file: null, name: null, parsed: null });
+  if (state.slots.length === 0) state.slots.push({ file: null, name: null, parsed: null, upganaMap: null, upganaName: null });
   invalidateSystemsCache();
   renderUploadSlots();
   render();
@@ -991,7 +1114,7 @@ function renderSingleTable(sys, area, stat) {
   let html = `<div class="accordion-toolbar">
     <button class="btn small" id="expandAllBtn">Expand all</button>
     <button class="btn small" id="collapseAllBtn">Collapse all</button>
-    <span class="metrics-help" title="Actual Runtime = sum of each phase's own start-to-end time within the step. Wait Time = elapsed time in the step not covered by any phase's active window (gaps between phases) - typically time spent paused on a manual prompt or waiting between runs. Wait time cannot detect a pause that happens in the middle of a single phase.">What do Actual Runtime / Wait Time mean?</span>
+    <span class="metrics-help" title="Actual Runtime = active processing time within the step. Wait Time = elapsed time not spent actively processing - typically a manual prompt or a paused session. When a companion UPGANA.html is uploaded, Actual Runtime uses SAP's own per-phase measurement (excludes time sitting at a dialog) - look for the 'SAP UPGANA' tag on the chip. Without it, Actual Runtime is estimated from each phase's own start-to-end span, which can't detect a pause occurring in the middle of a single phase.">What do Actual Runtime / Wait Time mean?</span>
   </div>`;
 
   stepNames.forEach((name, idx) => {
@@ -1016,6 +1139,7 @@ function renderSingleTable(sys, area, stat) {
       <div class="metric-chip elapsed"><span class="m-lbl">Elapsed</span><span class="m-val">${fmtMs(m.elapsedMs)}</span></div>
       <div class="metric-chip actual"><span class="m-lbl">Actual Runtime</span><span class="m-val">${fmtMs(m.actualRuntimeMs)}</span></div>
       <div class="metric-chip wait"><span class="m-lbl">Wait Time</span><span class="m-val">${fmtMs(m.waitTimeMs)}</span></div>
+      ${sourceTagHtml(m)}
     ` : '';
 
     html += `<div class="step-group" data-step-idx="${idx}">
@@ -1126,7 +1250,7 @@ function renderCompareTable(systems, area, stat) {
   let html = `<div class="accordion-toolbar">
     <button class="btn small" id="expandAllBtn">Expand all</button>
     <button class="btn small" id="collapseAllBtn">Collapse all</button>
-    <span class="metrics-help" title="Actual Runtime = sum of each phase's own start-to-end time within the step. Wait Time = elapsed time in the step not covered by any phase's active window (gaps between phases) - typically time spent paused on a manual prompt or waiting between runs. Wait time cannot detect a pause that happens in the middle of a single phase.">What do Actual Runtime / Wait Time mean?</span>
+    <span class="metrics-help" title="Actual Runtime = active processing time within the step. Wait Time = elapsed time not spent actively processing - typically a manual prompt or a paused session. When a companion UPGANA.html is uploaded, Actual Runtime uses SAP's own per-phase measurement (excludes time sitting at a dialog) - look for the 'SAP UPGANA' tag on the chip. Without it, Actual Runtime is estimated from each phase's own start-to-end span, which can't detect a pause occurring in the middle of a single phase.">What do Actual Runtime / Wait Time mean?</span>
   </div>`;
 
   let globalRowIdx = 0;
@@ -1144,6 +1268,7 @@ function renderCompareTable(systems, area, stat) {
           <div class="metric-chip actual"><span class="m-lbl">Actual</span><span class="m-val">${fmtMs(m.actualRuntimeMs)}</span></div>
           <div class="metric-chip wait"><span class="m-lbl">Wait</span><span class="m-val">${fmtMs(m.waitTimeMs)}</span></div>
         </div>
+        ${sourceTagHtml(m)}
       </div>`;
     }).join('');
 
