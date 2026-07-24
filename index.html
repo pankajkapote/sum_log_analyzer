@@ -291,6 +291,7 @@
   <div class="topbar-actions">
     <button class="btn" id="exportCsvBtn" style="display:none;">Export CSV</button>
     <button class="btn" id="exportPdfBtn" style="display:none;">Export PDF</button>
+    <button class="btn primary" id="generateTepBtn" style="display:none;">Generate TEP</button>
     <button class="btn" id="resetBtn" style="display:none;">Reset</button>
   </div>
 </div>
@@ -911,6 +912,7 @@ document.querySelectorAll('#filterSeg button').forEach(btn => {
 document.getElementById('resetBtn').addEventListener('click', () => location.reload());
 document.getElementById('exportCsvBtn').addEventListener('click', exportCsv);
 document.getElementById('exportPdfBtn').addEventListener('click', exportPdf);
+document.getElementById('generateTepBtn').addEventListener('click', generateTep);
 
 /* ============================= RENDER ============================= */
 function render() {
@@ -920,6 +922,7 @@ function render() {
   document.getElementById('emptyState').style.display = has ? 'none' : 'block';
   document.getElementById('exportCsvBtn').style.display = has ? 'inline-block' : 'none';
   document.getElementById('exportPdfBtn').style.display = has ? 'inline-block' : 'none';
+  document.getElementById('generateTepBtn').style.display = has ? 'inline-block' : 'none';
   document.getElementById('resetBtn').style.display = has ? 'inline-block' : 'none';
   document.getElementById('diffOnlyWrap').style.display = systems.length > 1 ? 'flex' : 'none';
   document.getElementById('legendDiff').style.display = systems.length > 1 ? 'flex' : 'none';
@@ -1415,6 +1418,275 @@ function exportPdf() {
   systems.forEach(s => parts.push(String(s.label).replace(/[^A-Za-z0-9_-]+/g, '_')));
   document.title = parts.join('_');
   window.print();
+}
+
+/* ============================= TECHNICAL EXECUTION PLAN (TEP) ============================= */
+
+// Groups a system's raw (uncollapsed) phase list by phase name, keeping every
+// attempt individually so repeats can be summarized without repeating the
+// full screen text - and keeping only phases that had a prompt or an error,
+// since those are the only ones worth documenting in an execution plan.
+function getTepPhaseGroups(sys) {
+  const byName = {};
+  const order = [];
+  sys.phases.forEach(p => {
+    if (!byName[p.name]) { byName[p.name] = []; order.push(p.name); }
+    byName[p.name].push(p);
+  });
+  return order
+    .map(name => ({ name, attempts: byName[name] }))
+    .filter(g => g.attempts.some(p => p.hasError || (p.prompts && p.prompts.length)));
+}
+
+function tepErrorText(p) {
+  if (!p.hasError) return '';
+  return (p.errors || []).filter(e => e.type !== 'headline').map(e => e.text).join(' | ') || (p.errors||[]).map(e=>e.text).join(' | ');
+}
+
+function tepSelectedText(p) {
+  return (p.prompts || []).map(pr => pr.selected).filter(Boolean).join('; ');
+}
+
+function tepSuggestions(systems) {
+  const lines = [];
+  systems.forEach(sys => {
+    const steps = sys.roadmapSteps || [];
+    if (!steps.length) return;
+    const totalElapsed = steps.reduce((a, s) => a + (s.elapsedMs || 0), 0);
+    const totalWait = steps.reduce((a, s) => a + (s.waitTimeMs || 0), 0);
+    const totalActual = steps.reduce((a, s) => a + (s.actualRuntimeMs || 0), 0);
+    const anyEstimated = steps.some(s => s.runtimeSource !== 'upgana');
+
+    const byWait = steps.slice().sort((a, b) => (b.waitTimeMs || 0) - (a.waitTimeMs || 0))[0];
+    const byActual = steps.slice().sort((a, b) => (b.actualRuntimeMs || 0) - (a.actualRuntimeMs || 0))[0];
+
+    const prefix = systems.length > 1 ? `[${sys.label}] ` : '';
+
+    if (totalElapsed > 0) {
+      const waitPct = Math.round((totalWait / totalElapsed) * 100);
+      lines.push(`${prefix}Overall, ${fmtMs(totalWait)} out of ${fmtMs(totalElapsed)} total elapsed time (${waitPct}%) was Wait Time rather than active processing. Reducing scheduling gaps and pre-staging manual decisions is the fastest lever to shorten the overall window.`);
+    }
+    if (byWait && byWait.waitTimeMs) {
+      lines.push(`${prefix}"${byWait.name}" had the single largest Wait Time (${fmtMs(byWait.waitTimeMs)}). If this was waiting on a manual decision, approval, or an overnight/weekend pause, pre-stage that decision before the technical window starts to avoid losing this time during the actual cutover.`);
+    }
+    if (byActual && byActual.actualRuntimeMs) {
+      lines.push(`${prefix}"${byActual.name}" had the highest active processing time (${fmtMs(byActual.actualRuntimeMs)}). If further optimization is needed, focus technical tuning here first (e.g. parallel processes, DB/HANA resource sizing, R3trans parallelism) rather than on scheduling.`);
+    }
+    const repeated = (sys.phases || []).reduce((acc, p) => { acc[p.name] = Math.max(acc[p.name] || 0, p.totalAttempts || 1); return acc; }, {});
+    const repeatedNames = Object.entries(repeated).filter(([, n]) => n > 1);
+    if (repeatedNames.length) {
+      lines.push(`${prefix}${repeatedNames.length} phase(s) had to be repeated (${repeatedNames.map(([n, c]) => `${n} \u00d7${c}`).join(', ')}). Root-causing why these needed a retry before the production run would remove avoidable rework from the critical path.`);
+    }
+    const errCount = (sys.phases || []).reduce((a, p) => a + (p.errors ? p.errors.length : 0), 0);
+    if (errCount > 0) {
+      lines.push(`${prefix}${errCount} error event(s) were logged across this run. A dry-run/rehearsal focused specifically on the phases that errored is recommended before the production cutover to confirm the fix holds.`);
+    }
+    if (anyEstimated) {
+      lines.push(`${prefix}Wait Time for this system is partly estimated from phase start/end gaps rather than SAP's own per-phase measurement. Upload the matching UPGANA.html in the tool for more precise Actual Runtime / Wait Time figures before finalizing this plan.`);
+    }
+  });
+  return lines;
+}
+
+const HEADER_FIELD_TEP = [
+  ['targetSystem','Target System'], ['procedure','Procedure'], ['dbType','Database Type'],
+  ['kernelRelease','Current Kernel'], ['kernelReleaseStack','Target Kernel (Stack)'],
+  ['scenarioStrategy','Scenario Strategy'], ['orchestrator','Orchestrator'], ['sapupRelease','SUM Release'],
+  ['stackFile','Stack Config File'], ['installationNumber','Installation No.'], ['systemNumber','System No.'],
+  ['hardwareKey','Hardware Key'], ['firstTimestamp','Run Started'], ['lastTimestamp','Last Log Entry'],
+];
+
+function buildTepSystemSection(sys) {
+  const steps = sys.roadmapSteps || [];
+  const totalElapsed = steps.reduce((a, s) => a + (s.elapsedMs || 0), 0);
+  const totalActual = steps.reduce((a, s) => a + (s.actualRuntimeMs || 0), 0);
+  const totalWait = steps.reduce((a, s) => a + (s.waitTimeMs || 0), 0);
+  const totalErrors = (sys.phases || []).reduce((a, p) => a + (p.errors ? p.errors.length : 0), 0);
+  const totalRepeats = (sys.phases || []).reduce((acc, p) => Math.max(acc, 0), 0);
+  const repeatedCount = Object.values((sys.phases||[]).reduce((acc,p)=>{acc[p.name]=Math.max(acc[p.name]||0,p.totalAttempts||1);return acc;},{})).filter(n=>n>1).length;
+
+  let html = `<h2>${esc(sys.label)} &mdash; System &amp; Upgrade Details</h2>`;
+  html += '<table class="kv-table">';
+  HEADER_FIELD_TEP.forEach(([key, label]) => {
+    const val = key === 'targetSystem' ? sys.label : sys.header[key];
+    if (!val) return;
+    html += `<tr><th>${label}</th><td>${esc(val)}</td></tr>`;
+  });
+  html += '</table>';
+
+  html += `<h2>Executive Summary</h2>`;
+  html += `<div class="summary-chips">
+    <div class="schip"><div class="slbl">Total Elapsed</div><div class="sval">${fmtMs(totalElapsed)}</div></div>
+    <div class="schip"><div class="slbl">Total Actual Runtime</div><div class="sval sv-ok">${fmtMs(totalActual)}</div></div>
+    <div class="schip"><div class="slbl">Total Wait Time</div><div class="sval sv-warn">${fmtMs(totalWait)}</div></div>
+    <div class="schip"><div class="slbl">Errors Logged</div><div class="sval ${totalErrors?'sv-err':''}">${totalErrors}</div></div>
+    <div class="schip"><div class="slbl">Phases Repeated</div><div class="sval ${repeatedCount?'sv-warn':''}">${repeatedCount}</div></div>
+  </div>`;
+
+  html += '<table class="step-summary-table"><thead><tr><th>Roadmap Step</th><th>Start</th><th>End</th><th>Elapsed</th><th>Actual Runtime</th><th>Wait Time</th><th>Source</th></tr></thead><tbody>';
+  steps.forEach(st => {
+    const src = st.runtimeSource === 'upgana' ? 'SAP UPGANA' : st.runtimeSource === 'mixed' ? 'UPGANA (partial)' : 'Estimated';
+    html += `<tr><td><strong>${esc(st.name)}</strong></td><td>${esc(st.startTime||'')}</td><td>${esc(st.endTime||'')}</td><td>${fmtMs(st.elapsedMs)}</td><td>${fmtMs(st.actualRuntimeMs)}</td><td>${fmtMs(st.waitTimeMs)}</td><td>${src}</td></tr>`;
+  });
+  html += '</tbody></table>';
+
+  html += `<h2>Roadmap Step Detail</h2>`;
+  steps.forEach(st => {
+    const stepPhaseGroups = getTepPhaseGroups(sys).filter(g => g.attempts[0].roadmapStep === st.name);
+    html += `<div class="tep-step">
+      <div class="tep-step-head">
+        <h3>${esc(st.name)}</h3>
+        <div class="tep-step-meta">${esc(st.startTime||'')} &rarr; ${esc(st.endTime||'')} &nbsp;|&nbsp; Elapsed ${fmtMs(st.elapsedMs)} &nbsp;|&nbsp; Actual ${fmtMs(st.actualRuntimeMs)} &nbsp;|&nbsp; Wait ${fmtMs(st.waitTimeMs)}</div>
+      </div>`;
+
+    if (!stepPhaseGroups.length) {
+      html += `<p class="tep-muted">No prompts or errors recorded in this step.</p>`;
+    }
+
+    stepPhaseGroups.forEach(g => {
+      const first = g.attempts[0];
+      const errBadge = g.attempts.some(p => p.hasError) ? '<span class="tep-badge tep-badge-err">ERROR</span>' : '<span class="tep-badge tep-badge-ok">OK</span>';
+      html += `<div class="tep-phase">
+        <div class="tep-phase-head">${errBadge} <span class="tep-phase-name">${esc(g.name)}</span> <span class="tep-phase-time">${esc(first.startTime||'')} &rarr; ${esc(first.endTime||'')}</span></div>`;
+
+      (first.prompts || []).forEach(pr => {
+        html += `<div class="tep-prompt">
+          <div class="tep-prompt-title">${esc(pr.title || 'Prompt')}</div>
+          ${pr.bodyText ? `<div class="tep-screen-text">${esc(pr.bodyText)}</div>` : ''}
+          ${(pr.options && pr.options.length) ? `<ul class="tep-opts">${pr.options.map(o => `<li class="${o.text===pr.selected?'tep-sel':''}">${esc(o.text)}</li>`).join('')}</ul>` : ''}
+          ${pr.selected ? `<div class="tep-selected">Selected: <strong>${esc(pr.selected)}</strong></div>` : ''}
+          ${(pr.fields && pr.fields.length) ? `<div class="tep-userinput"><em>User Input:</em> ${pr.fields.map(f=>`${esc(f.label)}: <strong>${f.value?esc(f.value):'(left blank)'}</strong>`).join(', ')}</div>` : ''}
+        </div>`;
+      });
+
+      if (first.hasError) {
+        html += `<div class="tep-error"><strong>Log File:</strong> ${(first.logFiles||[]).map(esc).join(', ') || '—'} &nbsp; <strong>Error:</strong> ${esc(tepErrorText(first))}</div>`;
+      }
+
+      if (g.attempts.length > 1) {
+        html += '<div class="tep-repeats"><div class="tep-repeats-lbl">Repeat Attempts (screen text not repeated)</div><ul>';
+        let prevErr = tepErrorText(first);
+        for (let i = 1; i < g.attempts.length; i++) {
+          const p = g.attempts[i];
+          const sel = tepSelectedText(p);
+          const err = tepErrorText(p);
+          let errNote = '';
+          if (p.hasError && err !== prevErr) errNote = ` &mdash; <strong>error changed:</strong> ${esc(err)}`;
+          else if (p.hasError) errNote = ' &mdash; same error as previous attempt';
+          else if (prevErr && !p.hasError) errNote = ' &mdash; resolved (no error this attempt)';
+          html += `<li>Attempt ${i+1} (${esc(p.startTime||'')} &rarr; ${esc(p.endTime||'')}): ${sel?('Selected: <strong>'+esc(sel)+'</strong>'):'—'}${errNote}</li>`;
+          prevErr = err;
+        }
+        html += '</ul></div>';
+      }
+
+      html += `<div class="tep-action"><span class="tep-action-lbl">Action Taken:</span><div class="tep-action-fill" contenteditable="true" data-placeholder="Click to add notes..."></div></div>`;
+      html += `</div>`;
+    });
+
+    html += `</div>`;
+  });
+
+  return html;
+}
+
+function buildTepHtml() {
+  const systems = loadedSystems();
+  const generatedAt = new Date().toLocaleString();
+  const suggestions = tepSuggestions(systems);
+  const titleSystems = systems.map(s => s.label).join(' vs ');
+
+  const sections = systems.map(buildTepSystemSection).join('<div class="tep-page-break"></div>');
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Technical Execution Plan &mdash; ${esc(titleSystems)}</title>
+<style>
+  :root{ --navy:#12294d; --accent:#0a6ed1; --muted:#5b6472; --line:#d9dee6; --ok:#1e8e5a; --warn:#b06a06; --err:#c0392b; }
+  *{ box-sizing:border-box; }
+  body{ font-family: Georgia, 'Times New Roman', serif; color:#1c2430; background:#fff; margin:0; padding:0 0 60px 0; line-height:1.55; }
+  .tep-wrap{ max-width: 980px; margin: 0 auto; padding: 40px 48px; }
+  .tep-cover{ text-align:center; border-bottom: 3px solid var(--navy); padding-bottom: 24px; margin-bottom: 30px; }
+  .tep-cover h1{ font-size:28px; color: var(--navy); margin:0 0 6px 0; font-family: Arial, sans-serif; }
+  .tep-cover .sub{ color: var(--muted); font-size:13px; font-family: Arial, sans-serif; }
+  h2{ font-family: Arial, sans-serif; color: var(--navy); font-size:18px; border-bottom:2px solid var(--line); padding-bottom:6px; margin: 34px 0 14px 0; }
+  h3{ font-family: Arial, sans-serif; color: var(--navy); font-size:15px; margin:0; }
+  table{ border-collapse: collapse; width:100%; font-size:13px; margin-bottom: 10px; }
+  table.kv-table th{ text-align:left; background:#f2f5f9; width:220px; padding:6px 10px; border:1px solid var(--line); font-family: Arial, sans-serif; font-size:12px; color:var(--muted); }
+  table.kv-table td{ padding:6px 10px; border:1px solid var(--line); }
+  table.step-summary-table th{ background: var(--navy); color:#fff; padding:7px 9px; text-align:left; font-family: Arial, sans-serif; font-size:11.5px; }
+  table.step-summary-table td{ padding:7px 9px; border:1px solid var(--line); font-size:12.5px; }
+  table.step-summary-table tr:nth-child(even){ background:#f7f9fb; }
+  .summary-chips{ display:flex; flex-wrap:wrap; gap:14px; margin-bottom: 16px; font-family: Arial, sans-serif; }
+  .schip{ border:1px solid var(--line); border-radius:8px; padding:10px 16px; min-width:140px; }
+  .schip .slbl{ font-size:10.5px; color:var(--muted); text-transform:uppercase; letter-spacing:.4px; }
+  .schip .sval{ font-size:18px; font-weight:700; color:var(--navy); }
+  .schip .sval.sv-ok{ color:var(--ok); } .schip .sval.sv-warn{ color:var(--warn); } .schip .sval.sv-err{ color:var(--err); }
+  .suggestions{ background:#f2f5f9; border-left:4px solid var(--accent); padding:14px 18px; border-radius:4px; }
+  .suggestions ul{ margin:0; padding-left:18px; font-size:13px; }
+  .suggestions li{ margin-bottom:8px; }
+  .tep-step{ margin-bottom: 22px; page-break-inside: avoid; }
+  .tep-step-head{ background: var(--navy); color:#fff; padding:9px 14px; border-radius:6px 6px 0 0; font-family: Arial, sans-serif; }
+  .tep-step-head h3{ color:#fff; display:inline; }
+  .tep-step-meta{ font-size:11.5px; color:#cfe0f5; margin-top:3px; }
+  .tep-muted{ color:var(--muted); font-size:12.5px; font-style:italic; padding: 6px 14px; }
+  .tep-phase{ border:1px solid var(--line); border-top:none; padding:12px 16px; }
+  .tep-phase-head{ font-family: Arial, sans-serif; font-size:13px; margin-bottom:8px; }
+  .tep-phase-name{ font-weight:700; font-family: 'Courier New', monospace; }
+  .tep-phase-time{ color:var(--muted); font-size:11.5px; margin-left:8px; }
+  .tep-badge{ font-family: Arial, sans-serif; font-size:10px; font-weight:700; padding:2px 7px; border-radius:10px; margin-right:6px; }
+  .tep-badge-ok{ background:#e3f3ea; color:var(--ok); } .tep-badge-err{ background:#fbe7e4; color:var(--err); }
+  .tep-prompt{ background:#fafbfc; border:1px solid var(--line); border-radius:6px; padding:10px 12px; margin-bottom:8px; }
+  .tep-prompt-title{ font-weight:700; font-family: Arial, sans-serif; font-size:13px; margin-bottom:4px; }
+  .tep-screen-text{ white-space:pre-wrap; font-family: 'Courier New', monospace; font-size:11.5px; color:#333; background:#fff; border:1px solid var(--line); border-radius:4px; padding:8px 10px; margin-bottom:6px; }
+  .tep-opts{ margin:4px 0; padding-left:18px; font-size:12.5px; color:var(--muted); }
+  .tep-opts .tep-sel{ color: var(--ok); font-weight:700; }
+  .tep-selected{ font-size:12.5px; margin-top:4px; }
+  .tep-userinput{ font-size:12px; margin-top:4px; background:#eef7f0; border:1px solid #cfe8d6; border-radius:4px; padding:5px 8px; }
+  .tep-error{ background:#fdf1ef; border:1px solid #f3d3cc; border-radius:6px; padding:8px 12px; font-size:12.5px; margin-bottom:8px; }
+  .tep-repeats{ font-size:12px; margin-bottom:8px; }
+  .tep-repeats-lbl{ font-family: Arial, sans-serif; font-weight:700; color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.4px; margin-bottom:3px; }
+  .tep-repeats ul{ margin:0; padding-left:18px; }
+  .tep-action{ margin-top:10px; font-family: Arial, sans-serif; }
+  .tep-action-lbl{ font-size:11.5px; font-weight:700; color:var(--muted); text-transform:uppercase; letter-spacing:.4px; display:block; margin-bottom:4px; }
+  .tep-action-fill{ border:1px dashed #b7c0cc; border-radius:5px; min-height:34px; padding:7px 10px; font-size:12.5px; color:#1c2430; }
+  .tep-action-fill:empty:before{ content: attr(data-placeholder); color:#9aa4b2; font-style:italic; }
+  .tep-action-fill:focus{ outline:2px solid var(--accent); border-style:solid; }
+  .tep-page-break{ page-break-before: always; }
+  .tep-footer{ text-align:center; color:var(--muted); font-size:11px; margin-top:40px; font-family: Arial, sans-serif; }
+  @media print { body{ padding:0; } .tep-wrap{ padding:20px 30px; } .tep-action-fill{ border-style:solid; } }
+</style>
+</head>
+<body>
+<div class="tep-wrap">
+  <div class="tep-cover">
+    <h1>Technical Execution Plan</h1>
+    <div class="sub">${esc(titleSystems)} &nbsp;&middot;&nbsp; Generated ${esc(generatedAt)} &nbsp;&middot;&nbsp; SUM Console Log Analyzer</div>
+  </div>
+
+  ${suggestions.length ? `<h2>Optimization Suggestions</h2><div class="suggestions"><ul>${suggestions.map(s=>`<li>${s}</li>`).join('')}</ul></div>` : ''}
+
+  ${sections}
+
+  <div class="tep-footer">Built by a BASIS guy, for BASIS guys &mdash; Pankaj Kapote. This document is editable in the browser (click any "Action Taken" box) - print to PDF or save the page to keep your notes.</div>
+</div>
+</body>
+</html>`;
+}
+
+function generateTep() {
+  const html = buildTepHtml();
+  const systems = loadedSystems();
+  const nameParts = ['TEP'];
+  systems.forEach(s => nameParts.push(String(s.label).replace(/[^A-Za-z0-9_-]+/g, '_')));
+  const blob = new Blob([html], { type: 'text/html' });
+  const url = URL.createObjectURL(blob);
+  window.open(url, '_blank');
+  const a = document.createElement('a');
+  a.href = url; a.download = nameParts.join('_') + '.html'; a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
 }
 
 </script>
