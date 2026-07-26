@@ -47,6 +47,21 @@
   .brand-text span{ font-size:11.5px; color: var(--muted); font-family: var(--mono); }
   .brand-text span.tagline{ font-style: italic; }
   .topbar-actions{ display:flex; gap:10px; align-items:center; }
+  .tep-btn-group{ display:inline-flex; gap:6px; position:relative; align-items:center; }
+  #tepOptionsToggle{ padding:8px 11px; font-size:14px; }
+  .tep-options-panel{
+    display:none; position:absolute; top:calc(100% + 8px); right:0; z-index:50;
+    background: var(--panel); border:1px solid var(--line); border-radius:9px;
+    padding:14px 16px; width:320px; box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+  }
+  .tep-options-panel.show{ display:block; }
+  .tep-opt-row{ display:block; font-size:12.5px; color: var(--text); line-height:1.5; cursor:pointer; }
+  .tep-opt-row input[type=checkbox]{ margin-right:6px; vertical-align:middle; }
+  .tep-opt-row input[type=text]{
+    display:block; width:100%; margin-top:6px; background: var(--panel-2); border:1px solid var(--line);
+    color: var(--text); border-radius:6px; padding:7px 9px; font-size:12.5px; font-family: var(--sans);
+  }
+  #tepMaskExtraRow{ margin-top:10px; cursor:default; }
   .btn{
     background: var(--panel-2); color: var(--text); border:1px solid var(--line);
     padding:8px 14px; border-radius:7px; font-size:12.5px; cursor:pointer;
@@ -291,7 +306,17 @@
   <div class="topbar-actions">
     <button class="btn" id="exportCsvBtn" style="display:none;">Export CSV</button>
     <button class="btn" id="exportPdfBtn" style="display:none;">Export PDF</button>
-    <button class="btn primary" id="generateTepBtn" style="display:none;">Generate TEP</button>
+    <div class="tep-btn-group" style="display:none;" id="tepBtnGroup">
+      <button class="btn primary" id="generateTepBtn">Generate TEP</button>
+      <button class="btn" id="tepOptionsToggle" title="TEP options">&#9881;</button>
+      <div class="tep-options-panel" id="tepOptionsPanel">
+        <label class="tep-opt-row"><input type="checkbox" id="tepMaskCheckbox"> Mask client-specific info (SID &rarr; &lt;SID-1&gt;, hostnames &rarr; &lt;hostname-1&gt;, IPs &rarr; XX.XX.XX.01, client transports &rarr; &lt;SID-1&gt;K..., install/system/hardware keys)</label>
+        <label class="tep-opt-row" id="tepMaskExtraRow" style="display:none;">
+          Company / customer names to mask (comma-separated, becomes &lt;Company-1&gt;, &lt;Company-2&gt;...)
+          <input type="text" id="tepMaskExtra" placeholder="e.g. client name, project codename">
+        </label>
+      </div>
+    </div>
     <button class="btn" id="resetBtn" style="display:none;">Reset</button>
   </div>
 </div>
@@ -913,6 +938,18 @@ document.getElementById('resetBtn').addEventListener('click', () => location.rel
 document.getElementById('exportCsvBtn').addEventListener('click', exportCsv);
 document.getElementById('exportPdfBtn').addEventListener('click', exportPdf);
 document.getElementById('generateTepBtn').addEventListener('click', generateTep);
+document.getElementById('tepOptionsToggle').addEventListener('click', (e) => {
+  e.stopPropagation();
+  document.getElementById('tepOptionsPanel').classList.toggle('show');
+});
+document.getElementById('tepMaskCheckbox').addEventListener('change', (e) => {
+  document.getElementById('tepMaskExtraRow').style.display = e.target.checked ? 'block' : 'none';
+});
+document.addEventListener('click', (e) => {
+  const panel = document.getElementById('tepOptionsPanel');
+  const group = document.getElementById('tepBtnGroup');
+  if (panel.classList.contains('show') && !group.contains(e.target)) panel.classList.remove('show');
+});
 
 /* ============================= RENDER ============================= */
 function render() {
@@ -922,7 +959,7 @@ function render() {
   document.getElementById('emptyState').style.display = has ? 'none' : 'block';
   document.getElementById('exportCsvBtn').style.display = has ? 'inline-block' : 'none';
   document.getElementById('exportPdfBtn').style.display = has ? 'inline-block' : 'none';
-  document.getElementById('generateTepBtn').style.display = has ? 'inline-block' : 'none';
+  document.getElementById('tepBtnGroup').style.display = has ? 'inline-flex' : 'none';
   document.getElementById('resetBtn').style.display = has ? 'inline-block' : 'none';
   document.getElementById('diffOnlyWrap').style.display = systems.length > 1 ? 'flex' : 'none';
   document.getElementById('legendDiff').style.display = systems.length > 1 ? 'flex' : 'none';
@@ -1676,11 +1713,106 @@ function buildTepHtml() {
 </html>`;
 }
 
+function escapeRegExp(s) { return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+// Redacts client-identifying information from an already-built TEP HTML
+// string: each system's real SID (<SID-1>, <SID-2>, ...), SAP-style
+// application-server hostnames (<hostname-1>, <hostname-2>, ...), IP
+// addresses (XX.XX.XX.01, XX.XX.XX.02, ...), user-supplied company/customer
+// terms (<Company-1>, <Company-2>, ...), and client transport requests whose
+// namespace matches a known SID (masked as <SID-n>K<number>, keeping the
+// number visible). SAP's own transports (SAPK...) and anything not matching
+// a known SID are deliberately left untouched, since they aren't client-
+// specific. Runs as a final pass over the assembled document rather than
+// threading masking through every builder function, since the content is
+// plain text embedded in simple, predictable markup.
+function maskTepHtml(html, systems, extraTerms) {
+  let out = html;
+  const hostMap = new Map();
+  let hostCounter = 0;
+  const ipMap = new Map();
+  let ipCounter = 0;
+
+  // Map of real SID (lowercase) -> placeholder, built first so transport
+  // masking can reuse the same placeholder as the SID itself.
+  const sidMap = new Map();
+  systems.forEach((sys, i) => {
+    const sid = sys.header && sys.header.targetSystem;
+    if (sid && !sidMap.has(sid.toLowerCase())) sidMap.set(sid.toLowerCase(), '<SID-' + (sidMap.size + 1) + '>');
+  });
+
+  // Transport requests: <namespace>K<number> - mask only when the namespace
+  // matches one of this document's known SIDs. Leave SAP's own (SAPK...) and
+  // any unrecognized/third-party namespace untouched.
+  out = out.replace(/(?<![A-Za-z0-9])([A-Za-z0-9]{3})K(\d{5,9})(?![A-Za-z0-9])/g, (m, ns, num) => {
+    if (ns.toUpperCase() === 'SAP') return m;
+    const placeholder = sidMap.get(ns.toLowerCase());
+    if (!placeholder) return m;
+    return placeholder + 'K' + num;
+  });
+
+  // SID itself, everywhere else it appears.
+  sidMap.forEach((placeholder, sidLower) => {
+    const re = new RegExp('(?<![A-Za-z0-9])' + escapeRegExp(sidLower) + '(?![A-Za-z0-9])', 'gi');
+    out = out.replace(re, placeholder);
+  });
+
+  // IP addresses - format XX.XX.XX.01, XX.XX.XX.02, ... in order of first
+  // appearance, regardless of the real octets.
+  out = out.replace(/\b(\d{1,3}\.){3}\d{1,3}\b/g, (m) => {
+    if (!ipMap.has(m)) { ipCounter++; ipMap.set(m, 'XX.XX.XX.' + String(ipCounter).padStart(2, '0')); }
+    return ipMap.get(m);
+  });
+
+  // UNC path hostnames, e.g. \\sapappq401\sapmnt\...
+  out = out.replace(/\\\\([A-Za-z0-9_-]+)\\/g, (m, host) => {
+    const key = host.toLowerCase();
+    if (!hostMap.has(key)) { hostCounter++; hostMap.set(key, '<hostname-' + hostCounter + '>'); }
+    return '\\\\' + hostMap.get(key) + '\\';
+  });
+  // Common SAP application-server hostname convention, e.g. sapappq401,
+  // sapdbq01, sapascsq00 - deliberately scoped to known role prefixes so it
+  // doesn't also catch generic SAP patch/component codes like SAPKCCC750.
+  // Uses lookaround boundaries (not \b) since these hostnames are often
+  // followed directly by an underscore (e.g. "sapappq401_S4Q_00"), and \b
+  // treats underscore as a word character so it wouldn't count as a boundary.
+  out = out.replace(/(?<![A-Za-z0-9])sap(?:app|db|ci|ascs|ers|pas|aas|host|ts|scs)[a-z]?\d{1,4}(?![A-Za-z0-9])/gi, (m) => {
+    const key = m.toLowerCase();
+    if (!hostMap.has(key)) { hostCounter++; hostMap.set(key, '<hostname-' + hostCounter + '>'); }
+    return hostMap.get(key);
+  });
+
+  ['Installation No.', 'System No.', 'Hardware Key'].forEach(label => {
+    const re = new RegExp('(<th>' + escapeRegExp(label) + '</th>\\s*<td>)([^<]*)(</td>)');
+    out = out.replace(re, '$1(masked)$3');
+  });
+
+  // Company/customer names - user-supplied, since these can't be reliably
+  // auto-detected. "SAP" itself is guarded against in case someone adds it
+  // by mistake.
+  (extraTerms || []).forEach((term, i) => {
+    const t = term.trim();
+    if (!t || t.toUpperCase() === 'SAP') return;
+    const re = new RegExp(escapeRegExp(t), 'gi');
+    out = out.replace(re, '<Company-' + (i + 1) + '>');
+  });
+
+  return out;
+}
+
 function generateTep() {
-  const html = buildTepHtml();
+  const maskOn = document.getElementById('tepMaskCheckbox') && document.getElementById('tepMaskCheckbox').checked;
+  const extraTermsRaw = document.getElementById('tepMaskExtra') ? document.getElementById('tepMaskExtra').value : '';
+  const extraTerms = extraTermsRaw.split(',').filter(Boolean);
+
+  let html = buildTepHtml();
   const systems = loadedSystems();
+  if (maskOn) html = maskTepHtml(html, systems, extraTerms);
+
   const nameParts = ['TEP'];
-  systems.forEach(s => nameParts.push(String(s.label).replace(/[^A-Za-z0-9_-]+/g, '_')));
+  systems.forEach((s, i) => nameParts.push(maskOn ? ('SID-' + (i + 1)) : String(s.label).replace(/[^A-Za-z0-9_-]+/g, '_')));
+  if (maskOn) nameParts.push('masked');
+
   const blob = new Blob([html], { type: 'text/html' });
   const url = URL.createObjectURL(blob);
   window.open(url, '_blank');
