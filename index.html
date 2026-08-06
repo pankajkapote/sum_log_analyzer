@@ -47,21 +47,6 @@
   .brand-text span{ font-size:11.5px; color: var(--muted); font-family: var(--mono); }
   .brand-text span.tagline{ font-style: italic; }
   .topbar-actions{ display:flex; gap:10px; align-items:center; }
-  .tep-btn-group{ display:inline-flex; gap:6px; position:relative; align-items:center; }
-  #tepOptionsToggle{ padding:8px 11px; font-size:14px; }
-  .tep-options-panel{
-    display:none; position:absolute; top:calc(100% + 8px); right:0; z-index:50;
-    background: var(--panel); border:1px solid var(--line); border-radius:9px;
-    padding:14px 16px; width:320px; box-shadow: 0 8px 24px rgba(0,0,0,0.4);
-  }
-  .tep-options-panel.show{ display:block; }
-  .tep-opt-row{ display:block; font-size:12.5px; color: var(--text); line-height:1.5; cursor:pointer; }
-  .tep-opt-row input[type=checkbox]{ margin-right:6px; vertical-align:middle; }
-  .tep-opt-row input[type=text]{
-    display:block; width:100%; margin-top:6px; background: var(--panel-2); border:1px solid var(--line);
-    color: var(--text); border-radius:6px; padding:7px 9px; font-size:12.5px; font-family: var(--sans);
-  }
-  #tepMaskExtraRow{ margin-top:10px; cursor:default; }
   .btn{
     background: var(--panel-2); color: var(--text); border:1px solid var(--line);
     padding:8px 14px; border-radius:7px; font-size:12.5px; cursor:pointer;
@@ -306,17 +291,7 @@
   <div class="topbar-actions">
     <button class="btn" id="exportCsvBtn" style="display:none;">Export CSV</button>
     <button class="btn" id="exportPdfBtn" style="display:none;">Export PDF</button>
-    <div class="tep-btn-group" style="display:none;" id="tepBtnGroup">
-      <button class="btn primary" id="generateTepBtn">Generate TEP</button>
-      <button class="btn" id="tepOptionsToggle" title="TEP options">&#9881;</button>
-      <div class="tep-options-panel" id="tepOptionsPanel">
-        <label class="tep-opt-row"><input type="checkbox" id="tepMaskCheckbox"> Mask client-specific info (SID &rarr; &lt;SID-1&gt;, hostnames &rarr; &lt;hostname-1&gt;, IPs &rarr; XX.XX.XX.01, client transports &rarr; &lt;SID-1&gt;K..., install/system/hardware keys)</label>
-        <label class="tep-opt-row" id="tepMaskExtraRow" style="display:none;">
-          Company / customer names to mask (comma-separated, becomes &lt;Company-1&gt;, &lt;Company-2&gt;...)
-          <input type="text" id="tepMaskExtra" placeholder="e.g. client name, project codename">
-        </label>
-      </div>
-    </div>
+    <button class="btn primary" id="generateTepBtn" style="display:none;">Generate TEP</button>
     <button class="btn" id="resetBtn" style="display:none;">Reset</button>
   </div>
 </div>
@@ -502,25 +477,37 @@ function parseLog(text) {
   function extractFields(bodyLines) {
     const fields = [];
     const diagnosticFields = [];
-    bodyLines.forEach(l => {
-      const t = l.trim();
-      if (!t) return;
+    for (let idx = 0; idx < bodyLines.length; idx++) {
+      const t = bodyLines[idx].trim();
+      if (!t) continue;
       const m = t.match(fieldLineRe);
-      if (!m) return;
-      const lbl = m[1].trim();
+      if (!m) continue;
+      let lbl = m[1].trim();
       const val = m[2].trim();
       // Reject "...sql script D:\usr\sap\..." style false positives, where a
       // sentence happens to end in a single drive letter right before the
       // colon of a Windows path - that's not a real Label: value field.
       const looksLikeDriveLetter = /(^|["'\s])[A-Za-z]$/.test(lbl) && /^\\/.test(val);
-      if (looksLikeDriveLetter) return;
+      if (looksLikeDriveLetter) continue;
       // Lines like A3EEMFLE_TOOLS 129 Table "MBEWH": status not set to
       // converted are SUM-generated diagnostic listings, not something a
-      // person typed - keep them separate from genuine user input.
+      // person typed - keep them separate from genuine user input. Classify
+      // using the original label, before any context gets appended below.
       const looksDiagnostic = /["]/.test(lbl) || /^[A-Z][A-Z0-9_]{2,}\s+\d+\b/.test(lbl);
+      // A bare "Password:" line doesn't say whose password - SUM often lists
+      // several in a row (DDIC, <sid>adm, DB user...). Pull in the preceding
+      // descriptive line (e.g. 'User "DDIC" in Client 000') for context.
+      if (/^password$/i.test(lbl)) {
+        let j = idx - 1;
+        while (j >= 0 && bodyLines[j].trim() === '') j--;
+        if (j >= 0) {
+          const ctx = bodyLines[j].trim();
+          if (ctx && !fieldLineRe.test(ctx)) lbl = 'Password (' + ctx + ')';
+        }
+      }
       if (looksDiagnostic) diagnosticFields.push({ label: lbl, value: val });
       else fields.push({ label: lbl, value: val });
-    });
+    }
     return { fields, diagnosticFields };
   }
 
@@ -593,13 +580,30 @@ function parseLog(text) {
         continue;
       }
 
+      // A bare 80-'=' divider closes out the current titled block. Most
+      // blocks also have an options list (handled above), but some - like
+      // "Required System Passwords" - are pure Label: value fields with no
+      // options at all, and previously fell through uncaptured entirely.
+      if (/^={3,}$/.test(line.trim())) {
+        if (lastSectionTitle) {
+          const { fields, diagnosticFields } = extractFields(promptBodyLines);
+          if (fields.length || diagnosticFields.length) {
+            const bodyText = promptBodyLines.map(l => l.trim()).filter((t,idx,arr) => !(t==='' && (idx===0 || arr[idx-1]==='')) ).join('\n').trim().slice(0, 3000);
+            prompts.push({ title: lastSectionTitle, options: [], selectionLabel: null, selected: null, fields, diagnosticFields, bodyText });
+          }
+        }
+        promptBodyLines = [];
+        lastSectionTitle = null;
+        continue;
+      }
+
       // Free text between a section title and its options block (or general
       // narrative text) - scanned for inline "Label: value" user-entered
       // fields (e.g. "SPDD Transport: S4XK900049") and kept verbatim so the
       // full prompt text can be shown on demand even when nothing matches.
-      if (line.trim() !== '' && !/^={3,}$/.test(line.trim())) {
+      if (line.trim() !== '') {
         promptBodyLines.push(line);
-      } else if (line.trim() === '') {
+      } else {
         promptBodyLines.push('');
       }
     }
@@ -938,18 +942,6 @@ document.getElementById('resetBtn').addEventListener('click', () => location.rel
 document.getElementById('exportCsvBtn').addEventListener('click', exportCsv);
 document.getElementById('exportPdfBtn').addEventListener('click', exportPdf);
 document.getElementById('generateTepBtn').addEventListener('click', generateTep);
-document.getElementById('tepOptionsToggle').addEventListener('click', (e) => {
-  e.stopPropagation();
-  document.getElementById('tepOptionsPanel').classList.toggle('show');
-});
-document.getElementById('tepMaskCheckbox').addEventListener('change', (e) => {
-  document.getElementById('tepMaskExtraRow').style.display = e.target.checked ? 'block' : 'none';
-});
-document.addEventListener('click', (e) => {
-  const panel = document.getElementById('tepOptionsPanel');
-  const group = document.getElementById('tepBtnGroup');
-  if (panel.classList.contains('show') && !group.contains(e.target)) panel.classList.remove('show');
-});
 
 /* ============================= RENDER ============================= */
 function render() {
@@ -959,7 +951,7 @@ function render() {
   document.getElementById('emptyState').style.display = has ? 'none' : 'block';
   document.getElementById('exportCsvBtn').style.display = has ? 'inline-block' : 'none';
   document.getElementById('exportPdfBtn').style.display = has ? 'inline-block' : 'none';
-  document.getElementById('tepBtnGroup').style.display = has ? 'inline-flex' : 'none';
+  document.getElementById('generateTepBtn').style.display = has ? 'inline-block' : 'none';
   document.getElementById('resetBtn').style.display = has ? 'inline-block' : 'none';
   document.getElementById('diffOnlyWrap').style.display = systems.length > 1 ? 'flex' : 'none';
   document.getElementById('legendDiff').style.display = systems.length > 1 ? 'flex' : 'none';
@@ -1533,6 +1525,33 @@ const HEADER_FIELD_TEP = [
   ['hardwareKey','Hardware Key'], ['firstTimestamp','Run Started'], ['lastTimestamp','Last Log Entry'],
 ];
 
+function buildTepUserInputsSection(sys) {
+  const seen = new Set();
+  const rows = [];
+  (sys.phases || []).forEach(p => {
+    (p.prompts || []).forEach(pr => {
+      (pr.fields || []).forEach(f => {
+        const key = p.name + '|' + f.label;
+        if (seen.has(key)) return;
+        seen.add(key);
+        rows.push({ roadmapStep: p.roadmapStep, phase: p.name, label: f.label, value: f.value });
+      });
+    });
+  });
+  if (!rows.length) return '';
+  const stepOrder = (sys.roadmapSteps || []).map(s => s.name);
+  rows.sort((a, b) => stepOrder.indexOf(a.roadmapStep) - stepOrder.indexOf(b.roadmapStep));
+
+  let html = `<h2>User Inputs Required</h2>`;
+  html += `<p class="tep-note">These are the values SUM asked for during this run (passwords, instance numbers, transport requests, uptime/downtime process names, etc.) - not selection options, but things that had to be typed in. Have these ready in advance before starting the next upgrade to avoid losing time waiting on a decision.</p>`;
+  html += '<table class="step-summary-table"><thead><tr><th>Roadmap Step</th><th>Phase</th><th>Input Needed</th><th>Value Given (this run)</th></tr></thead><tbody>';
+  rows.forEach(r => {
+    html += `<tr><td>${esc(r.roadmapStep)}</td><td style="font-family:'Courier New',monospace; font-size:11.5px;">${esc(r.phase)}</td><td>${esc(r.label)}</td><td>${r.value ? esc(r.value) : '<em>(left blank)</em>'}</td></tr>`;
+  });
+  html += '</tbody></table>';
+  return html;
+}
+
 function buildTepSystemSection(sys) {
   const steps = sys.roadmapSteps || [];
   const totalElapsed = steps.reduce((a, s) => a + (s.elapsedMs || 0), 0);
@@ -1566,6 +1585,8 @@ function buildTepSystemSection(sys) {
     html += `<tr><td><strong>${esc(st.name)}</strong></td><td>${esc(st.startTime||'')}</td><td>${esc(st.endTime||'')}</td><td>${fmtMs(st.elapsedMs)}</td><td>${fmtMs(st.actualRuntimeMs)}</td><td>${fmtMs(st.waitTimeMs)}</td><td>${src}</td></tr>`;
   });
   html += '</tbody></table>';
+
+  html += buildTepUserInputsSection(sys);
 
   html += `<h2>Roadmap Step Detail</h2>`;
   steps.forEach(st => {
@@ -1669,6 +1690,7 @@ function buildTepHtml() {
   .tep-step-head h3{ color:#fff; display:inline; }
   .tep-step-meta{ font-size:11.5px; color:#cfe0f5; margin-top:3px; }
   .tep-muted{ color:var(--muted); font-size:12.5px; font-style:italic; padding: 6px 14px; }
+  .tep-note{ color:var(--muted); font-size:12.5px; margin: -4px 0 10px 0; }
   .tep-phase{ border:1px solid var(--line); border-top:none; padding:12px 16px; }
   .tep-phase-head{ font-family: Arial, sans-serif; font-size:13px; margin-bottom:8px; }
   .tep-phase-name{ font-weight:700; font-family: 'Courier New', monospace; }
@@ -1703,9 +1725,9 @@ function buildTepHtml() {
     <div class="sub">${esc(titleSystems)} &nbsp;&middot;&nbsp; Generated ${esc(generatedAt)} &nbsp;&middot;&nbsp; SUM Console Log Analyzer</div>
   </div>
 
-  ${suggestions.length ? `<h2>Optimization Suggestions</h2><div class="suggestions"><ul>${suggestions.map(s=>`<li>${s}</li>`).join('')}</ul></div>` : ''}
-
   ${sections}
+
+  ${suggestions.length ? `<div class="tep-page-break"></div><h2>Optimization Suggestions</h2><div class="suggestions"><ul>${suggestions.map(s=>`<li>${s}</li>`).join('')}</ul></div>` : ''}
 
   <div class="tep-footer">Built by a BASIS guy, for BASIS guys &mdash; Pankaj Kapote. This document is editable in the browser (click any "Action Taken" box) - print to PDF or save the page to keep your notes.</div>
 </div>
@@ -1713,106 +1735,11 @@ function buildTepHtml() {
 </html>`;
 }
 
-function escapeRegExp(s) { return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
-
-// Redacts client-identifying information from an already-built TEP HTML
-// string: each system's real SID (<SID-1>, <SID-2>, ...), SAP-style
-// application-server hostnames (<hostname-1>, <hostname-2>, ...), IP
-// addresses (XX.XX.XX.01, XX.XX.XX.02, ...), user-supplied company/customer
-// terms (<Company-1>, <Company-2>, ...), and client transport requests whose
-// namespace matches a known SID (masked as <SID-n>K<number>, keeping the
-// number visible). SAP's own transports (SAPK...) and anything not matching
-// a known SID are deliberately left untouched, since they aren't client-
-// specific. Runs as a final pass over the assembled document rather than
-// threading masking through every builder function, since the content is
-// plain text embedded in simple, predictable markup.
-function maskTepHtml(html, systems, extraTerms) {
-  let out = html;
-  const hostMap = new Map();
-  let hostCounter = 0;
-  const ipMap = new Map();
-  let ipCounter = 0;
-
-  // Map of real SID (lowercase) -> placeholder, built first so transport
-  // masking can reuse the same placeholder as the SID itself.
-  const sidMap = new Map();
-  systems.forEach((sys, i) => {
-    const sid = sys.header && sys.header.targetSystem;
-    if (sid && !sidMap.has(sid.toLowerCase())) sidMap.set(sid.toLowerCase(), '<SID-' + (sidMap.size + 1) + '>');
-  });
-
-  // Transport requests: <namespace>K<number> - mask only when the namespace
-  // matches one of this document's known SIDs. Leave SAP's own (SAPK...) and
-  // any unrecognized/third-party namespace untouched.
-  out = out.replace(/(?<![A-Za-z0-9])([A-Za-z0-9]{3})K(\d{5,9})(?![A-Za-z0-9])/g, (m, ns, num) => {
-    if (ns.toUpperCase() === 'SAP') return m;
-    const placeholder = sidMap.get(ns.toLowerCase());
-    if (!placeholder) return m;
-    return placeholder + 'K' + num;
-  });
-
-  // SID itself, everywhere else it appears.
-  sidMap.forEach((placeholder, sidLower) => {
-    const re = new RegExp('(?<![A-Za-z0-9])' + escapeRegExp(sidLower) + '(?![A-Za-z0-9])', 'gi');
-    out = out.replace(re, placeholder);
-  });
-
-  // IP addresses - format XX.XX.XX.01, XX.XX.XX.02, ... in order of first
-  // appearance, regardless of the real octets.
-  out = out.replace(/\b(\d{1,3}\.){3}\d{1,3}\b/g, (m) => {
-    if (!ipMap.has(m)) { ipCounter++; ipMap.set(m, 'XX.XX.XX.' + String(ipCounter).padStart(2, '0')); }
-    return ipMap.get(m);
-  });
-
-  // UNC path hostnames, e.g. \\sapappq401\sapmnt\...
-  out = out.replace(/\\\\([A-Za-z0-9_-]+)\\/g, (m, host) => {
-    const key = host.toLowerCase();
-    if (!hostMap.has(key)) { hostCounter++; hostMap.set(key, '<hostname-' + hostCounter + '>'); }
-    return '\\\\' + hostMap.get(key) + '\\';
-  });
-  // Common SAP application-server hostname convention, e.g. sapappq401,
-  // sapdbq01, sapascsq00 - deliberately scoped to known role prefixes so it
-  // doesn't also catch generic SAP patch/component codes like SAPKCCC750.
-  // Uses lookaround boundaries (not \b) since these hostnames are often
-  // followed directly by an underscore (e.g. "sapappq401_S4Q_00"), and \b
-  // treats underscore as a word character so it wouldn't count as a boundary.
-  out = out.replace(/(?<![A-Za-z0-9])sap(?:app|db|ci|ascs|ers|pas|aas|host|ts|scs)[a-z]?\d{1,4}(?![A-Za-z0-9])/gi, (m) => {
-    const key = m.toLowerCase();
-    if (!hostMap.has(key)) { hostCounter++; hostMap.set(key, '<hostname-' + hostCounter + '>'); }
-    return hostMap.get(key);
-  });
-
-  ['Installation No.', 'System No.', 'Hardware Key'].forEach(label => {
-    const re = new RegExp('(<th>' + escapeRegExp(label) + '</th>\\s*<td>)([^<]*)(</td>)');
-    out = out.replace(re, '$1(masked)$3');
-  });
-
-  // Company/customer names - user-supplied, since these can't be reliably
-  // auto-detected. "SAP" itself is guarded against in case someone adds it
-  // by mistake.
-  (extraTerms || []).forEach((term, i) => {
-    const t = term.trim();
-    if (!t || t.toUpperCase() === 'SAP') return;
-    const re = new RegExp(escapeRegExp(t), 'gi');
-    out = out.replace(re, '<Company-' + (i + 1) + '>');
-  });
-
-  return out;
-}
-
 function generateTep() {
-  const maskOn = document.getElementById('tepMaskCheckbox') && document.getElementById('tepMaskCheckbox').checked;
-  const extraTermsRaw = document.getElementById('tepMaskExtra') ? document.getElementById('tepMaskExtra').value : '';
-  const extraTerms = extraTermsRaw.split(',').filter(Boolean);
-
-  let html = buildTepHtml();
+  const html = buildTepHtml();
   const systems = loadedSystems();
-  if (maskOn) html = maskTepHtml(html, systems, extraTerms);
-
   const nameParts = ['TEP'];
-  systems.forEach((s, i) => nameParts.push(maskOn ? ('SID-' + (i + 1)) : String(s.label).replace(/[^A-Za-z0-9_-]+/g, '_')));
-  if (maskOn) nameParts.push('masked');
-
+  systems.forEach(s => nameParts.push(String(s.label).replace(/[^A-Za-z0-9_-]+/g, '_')));
   const blob = new Blob([html], { type: 'text/html' });
   const url = URL.createObjectURL(blob);
   window.open(url, '_blank');
