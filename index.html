@@ -162,6 +162,8 @@
   .step-group.open .step-head .chev{ transform: rotate(90deg); }
   .step-head .step-name{ font-family: var(--mono); font-weight:700; font-size:13.5px; color: var(--text); }
   .step-head .step-count{ font-size:11px; color: var(--muted); font-family: var(--mono); }
+  .step-head .step-times{ font-size:11px; color: var(--muted); font-family: var(--mono); white-space:nowrap; }
+  .sys-metric-block .step-times{ font-size:10px; color: var(--muted); font-family: var(--mono); white-space:nowrap; }
   .step-metrics{ display:flex; gap:8px; margin-left:auto; flex-wrap:wrap; }
   .metric-chip{
     display:flex; flex-direction:column; align-items:flex-start; background: var(--panel-2);
@@ -1179,6 +1181,7 @@ function renderSingleTable(sys, area, stat) {
         <span class="chev">&#9656;</span>
         <span class="step-name">${esc(name)}</span>
         <span class="step-count">${stepPhases.length} phase${stepPhases.length!==1?'s':''} shown${errCount?` &middot; <span style="color:var(--err)">${errCount} error${errCount!==1?'s':''}</span>`:''}</span>
+        ${m && (m.startTime || m.endTime) ? `<span class="step-times">${esc(m.startTime||'?')} &rarr; ${esc(m.endTime||'?')}</span>` : ''}
         <div class="step-metrics">${metricsHtml}</div>
       </div>
       ${m && m.statusNote ? `<div class="step-status-note">${esc(m.statusNote)}</div>` : ''}
@@ -1295,6 +1298,7 @@ function renderCompareTable(systems, area, stat) {
       if (!m) return `<div class="sys-metric-block"><span class="sys-name">${esc(s.label)}</span><span class="muted" style="font-size:11px;">not present</span></div>`;
       return `<div class="sys-metric-block">
         <span class="sys-name">${esc(s.label)}</span>
+        ${(m.startTime || m.endTime) ? `<span class="step-times">${esc(m.startTime||'?')} &rarr; ${esc(m.endTime||'?')}</span>` : ''}
         <div class="chips">
           <div class="metric-chip elapsed"><span class="m-lbl">Elapsed</span><span class="m-val">${fmtMs(m.elapsedMs)}</span></div>
           <div class="metric-chip actual"><span class="m-lbl">Actual</span><span class="m-val">${fmtMs(m.actualRuntimeMs)}</span></div>
